@@ -1,0 +1,2 @@
+For alpha-diversity output, refer to folder "Table 1".
+For performance data, refer to folder "Figure 1 + 2".

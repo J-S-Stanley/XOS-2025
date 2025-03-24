@@ -1,0 +1,231 @@
+#################################################################
+#
+# Discriminative OTUs determined using ALDEx2
+#
+#################################################################
+
+
+# packages
+library(TreeSummarizedExperiment)
+library(SummarizedExperiment)
+library(ANCOMBC)
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(xlsx)
+
+
+# set the minimum prevalence and depth
+min.prevalence = 0.1
+min.depth = 50
+
+
+# read in the data
+data <- read_tsv(file = 'final.opti_mcc.shared')
+metadata_file <- read_xlsx('metadata.xlsx')
+
+
+# get the list of samples that remain following subsampling
+# use this list to select samples from final.opti_mcc_shared later
+subsampled_names_upper <- read_tsv('final.opti_mcc_upper.0.03.subsample.shared') %>%
+  dplyr::select(Group)
+
+subsampled_names_lower <- read_tsv('final.opti_mcc_lower.0.03.subsample.shared') %>%
+  dplyr::select(Group)
+
+subsampled_names_list_upper <- subsampled_names_upper$Group
+subsampled_names_list_lower <- subsampled_names_lower$Group
+subsampled_names_list <- c(subsampled_names_list_upper, subsampled_names_list_lower)
+
+
+# change metadata column name to 'group'
+colnames(metadata_file)[2] = 'group'
+
+
+# remove standards, mocks, controls etc from metadata 
+metadata_removed <- metadata_file %>%
+  filter(treatment != 'NA')
+
+
+# use subsampled names list generated earlier to obtain subsampled ID list
+subsampled_id_list <- (metadata_removed %>% filter(sample_id %in% subsampled_names_list))$group
+
+
+# use subsampled id list to select only samples remaining following subsampling from metadata file
+metadata <- metadata_removed %>%
+  dplyr::select(group, treatment, sample_date, Location, disease_stat) %>%
+  dplyr::rename(date = sample_date) %>%
+  dplyr::rename(site = Location) %>%
+  filter(group %in% c(subsampled_id_list)) %>%
+  group_by(date, site) %>%
+  mutate(sampleid = group) %>%
+  dplyr::rename(SampleID = 'group') %>%
+  remove_rownames() %>%
+  column_to_rownames(var = 'sampleid') 
+
+metadata_summary <- metadata %>%
+  group_by(date, site, treatment) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+# select samples that remain following subsampling
+# edit dataframe for downstream processing
+select_data <- data %>% 
+  filter(Group %in% subsampled_names_list) %>%
+  separate(col = Group, sep = "_", remove = FALSE,
+           into = c("pigid", "date", "pen", "pigno", "diet1", "diet2")) %>%
+  dplyr::select(-c(Group, date, pen, pigno, diet1, diet2)) %>%
+  dplyr::rename(Group = 'pigid') %>%
+  dplyr::select(which(colSums(. != 0)>=nrow(.)*min.prevalence)) %>%
+  dplyr::select(where(~ any(.x >= min.depth)))
+
+abundance_data <- select_data %>%
+  remove_rownames() %>%
+  column_to_rownames(var = 'Group') %>%
+  dplyr::select(-numOtus) %>%
+  t()
+
+
+# create blank data frame to bind non-significant and significant results for each iteration of the forloops
+all_results <- data.frame()
+sig_results <- data.frame()
+
+
+# loop through each iteration of timepoint and GIT site, and perform ANCOM-BC2 analysis
+for(i in unique(metadata$date)) {
+  for( j in unique(metadata$site)) {
+    
+    # subset
+    subset_metadata <- metadata[metadata$date == i & metadata$site == j, ]
+    
+    # order metadata alphabeticaaly so CTL is first so ancombc2 uses the first group as the control
+    subset_metadata <- subset_metadata[with(subset_metadata, order(treatment)), ]
+    
+    # remove unwanted columns
+    subset_metadata <- subset_metadata %>%
+      dplyr::select(-date, -site, -disease_stat)
+
+    # select samples we have subset for (above) from abundance data
+    subset_abundance_data <- as.data.frame(abundance_data) %>%      # convert the matrix to a data frame
+      dplyr::select(subset_metadata$SampleID)                       # use select() to remove the column
+    subset_abundance_data <- as.matrix(subset_abundance_data)       # convert back to a matrix
+
+    # create TreeSummarizedExperiment object
+    tse <- TreeSummarizedExperiment(
+      assays = list(counts = subset_abundance_data),
+      colData = subset_metadata)
+
+    # configure analysis parameters
+    k <- list('none')           # set p_adj_method 
+    l <- list(0)                # set prv_cut -- set to 0 if already set earlier
+    m <- list(0.05)             # set alpha
+    
+    for (k in k) {
+      for (l in l) {
+        for (m in m) {
+          
+          
+          # Perform ancombc2
+          output <- ancombc2(data = tse, 
+                             assay_name = "counts", 
+                             # tax_level = 'Species',
+                             fix_formula = "treatment", 
+                             rand_formula = NULL,
+                             p_adj_method = k, 
+                             pseudo = 0, 
+                             pseudo_sens = TRUE,
+                             prv_cut = l, 
+                             lib_cut = 0, 
+                             s0_perc = 0.05,
+                             group = "treatment", 
+                             struc_zero = TRUE, 
+                             neg_lb = TRUE,
+                             alpha = m, 
+                             # n_cl = 4, 
+                             verbose = TRUE,
+                             global = FALSE, 
+                             pairwise = TRUE, 
+                             dunnet = TRUE, 
+                             trend = FALSE,
+                             iter_control = list(tol = 1e-2, max_iter = 20, verbose = TRUE),
+                             em_control = list(tol = 1e-5, max_iter = 100),
+                             lme_control = lme4::lmerControl(),
+                             mdfdr_control = list(fwer_ctrl_method = 'none', B = 100))
+
+          # structural zeros
+          tab_zero <- output$zero_ind
+          assign(paste0('Struc_zero_', i, '_', j, '_prv=', l, '_alpha=', m, '_', k), tab_zero, envir = .GlobalEnv)
+          
+          # sensitivity scores
+          tab_sens <- output$pseudo_sens_tab
+          assign(paste0('Tab_sens_', i, '_', j, '_prv=', l, '_alpha=', m, '_', k), tab_sens, envir = .GlobalEnv)
+          
+          # ancom-bc2 primary analysis
+          res_prim <- output$res %>%
+            mutate(subset = paste0(i, '_', j)) %>%
+            mutate(prv_cut = paste0(l)) %>%
+            mutate(alpha = paste0(m)) %>%
+            mutate(p_adj_method = paste0(k)) %>%
+            mutate(analysis = 'ancombc2')
+          
+          assign(paste0('Non_sig_LFC_', i, '_', j, '_prv=', l, '_alpha=', m, '_', k), res_prim, envir = .GlobalEnv)
+          
+          # ancom-bc2 significant features
+          sig_res_prim <- output$res %>%
+            filter(diff_treatmentXOS_Hi == 'TRUE' | diff_treatmentXOS_Lo == 'TRUE') %>%
+            mutate(subset = paste0(i, '_', j)) %>%
+            mutate(prv_cut = paste0(l)) %>%
+            mutate(alpha = paste0(m)) %>%
+            mutate(p_adj_method = paste0(k)) %>%
+            mutate(analysis = 'ancombc2')
+          
+          assign(paste0('Sig_LFC_', i, '_', j, '_prv=', l, '_alpha=', m, '_', k), sig_res_prim, envir = .GlobalEnv)
+
+          # bind non-significant results for each iteration to a single dataframe that can be exported
+          all_results <- rbind(all_results, res_prim)
+          
+          # bind significant results for each iteration to a single dataframe that can be exported
+          sig_results <- rbind(sig_results, sig_res_prim)
+
+        }
+      }
+    }
+  }
+}
+
+
+# tidy results dataframes
+all_results_tidy <- all_results %>%
+  rename(pval_xoshi = 'p_treatmentXOS_Hi') %>%
+  rename(pval_xoslo = 'p_treatmentXOS_Lo') %>%
+  rename(pval_xoshi_holm = 'q_treatmentXOS_Hi') %>%
+  rename(pval_xoslo_holm = 'q_treatmentXOS_Lo') %>%
+  rename(effect_xoshi = 'lfc_treatmentXOS_Hi') %>%
+  rename(effect_xoslo = 'lfc_treatmentXOS_Lo') %>%
+  dplyr::select(taxon, pval_xoshi, pval_xoslo, pval_xoshi_holm, pval_xoslo_holm, effect_xoshi, effect_xoslo, subset, analysis)
+
+all_results_hi <- all_results_tidy %>%
+  dplyr::select(taxon, pval_xoshi, pval_xoshi_holm, effect_xoshi, subset, analysis) %>%
+  rename(pval = 'pval_xoshi') %>%
+  rename(pval_holm = 'pval_xoshi_holm') %>%
+  rename(effect = 'effect_xoshi') %>%
+  mutate(diet = 'xos_hi')
+
+all_results_lo <- all_results_tidy %>%
+  dplyr::select(taxon, pval_xoslo, pval_xoslo_holm, effect_xoslo, subset, analysis) %>%
+  rename(pval = 'pval_xoslo') %>%
+  rename(pval_holm = 'pval_xoslo_holm') %>%
+  rename(effect = 'effect_xoslo') %>%
+  mutate(diet = 'xos_lo')
+
+
+# combine xos_lo & xos_hi results dataframes
+all_results_output <- rbind(all_results_hi, all_results_lo)
+
+
+# filter the combined xos_lo & xos_hi results dataframe for significant features
+sig_results_output <- all_results_output %>%
+  filter(pval_holm < 0.05)
+
+all_results_nonsubsampled <- all_results_output
+sig_results_nonsubsampled <- sig_results_output
