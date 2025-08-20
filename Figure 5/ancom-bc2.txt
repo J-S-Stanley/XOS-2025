@@ -1,6 +1,6 @@
 #################################################################
 #
-# Discriminative OTUs determined using ALDEx2
+# Discriminative OTUs determined using ANCOM-BC2
 #
 #################################################################
 
@@ -228,4 +228,5 @@ sig_results_output <- all_results_output %>%
   filter(pval_holm < 0.05)
 
 all_results_nonsubsampled <- all_results_output
+
 sig_results_nonsubsampled <- sig_results_output
